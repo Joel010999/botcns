@@ -1,37 +1,50 @@
 const express = require('express');
 const app = express();
-const port = process.env.PORT || 3000;
 
-// Middleware para parsear JSON
 app.use(express.json());
 
-// Ruta GET para la verificación del webhook de WhatsApp
-app.get('/webhook', (req, res) => {
-    const verify_token = process.env.VERIFY_TOKEN || 'token_seguro_nuevo_siglo';
-    
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
+// Ajustamos al puerto 8080 que te asignó Railway en el log
+const PORT = process.env.PORT || 8080;
 
-    if (mode && token) {
-        if (mode === 'subscribe' && token === verify_token) {
-            console.log('WEBHOOK_VERIFIED');
-            res.status(200).send(challenge);
-        } else {
-            res.sendStatus(403);
-        }
-    } else {
-        res.status(400).send('Faltan parámetros de verificación');
-    }
-});
-
-// Ruta POST para recibir los mensajes
 app.post('/webhook', (req, res) => {
-    console.log('Mensaje recibido:', JSON.stringify(req.body, null, 2));
-    // Es importante devolver un 200 OK rápidamente para que WhatsApp sepa que se recibió el evento
+    const body = req.body;
+
+    // 1. Validamos que el evento sea la llegada de un mensaje
+    if (body.event === 'messages.upsert') {
+        const data = body.data;
+
+        // 2. Filtro de seguridad: ignorar mensajes enviados por el propio bot
+        if (data.key.fromMe) {
+            return res.status(200).send('EVENT_RECEIVED');
+        }
+
+        // 3. Extraemos la información útil
+        const numeroPadre = data.key.remoteJid;
+        const nombrePadre = data.pushName;
+
+        let mensajeEntrante = '';
+
+        // Evolution API manda el texto plano en 'conversation'
+        if (data.message && data.message.conversation) {
+            mensajeEntrante = data.message.conversation;
+        }
+        // Si mandan un emoji o texto citado, puede venir en 'extendedTextMessage'
+        else if (data.message && data.message.extendedTextMessage && data.message.extendedTextMessage.text) {
+            mensajeEntrante = data.message.extendedTextMessage.text;
+        }
+
+        // 4. Imprimimos el resultado limpio
+        if (mensajeEntrante) {
+            console.log(`Mensaje de ${nombrePadre} (${numeroPadre}): ${mensajeEntrante}`);
+        } else {
+            console.log(`Se recibió un archivo, audio o formato no soportado de ${nombrePadre}`);
+        }
+    }
+
+    // Siempre devolver 200 rápido para que Evolution no reintente el envío
     res.status(200).send('EVENT_RECEIVED');
 });
 
-app.listen(port, () => {
-    console.log(`Servidor Express escuchando en el puerto ${port}`);
+app.listen(PORT, () => {
+    console.log(`Servidor Express de RenderByte escuchando en el puerto ${PORT}`);
 });
