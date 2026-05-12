@@ -2,106 +2,126 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const { OpenAI } = require('openai');
+const { Pool } = require('pg');
 
 const app = express();
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY
+// Configuración de la base de datos
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
 });
 
 const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL;
 const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY;
 const INSTANCE_NAME = 'colegio-bot';
-const { Pool } = require('pg');
-
-// Configuramos la conexión a la base de datos del colegio
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: {
-        rejectUnauthorized: false // Necesario para bases de datos en la nube como Railway
-    }
-});
 
 app.use(express.json());
-
-// Ajustamos al puerto 8080 que te asignó Railway en el log
 const PORT = process.env.PORT || 8080;
 
-// Definimos el rol y las reglas estrictas del bot
-const promptSistema = `Sos el asistente virtual del departamento de administración del "Colegio Nuevo Siglo".
-Tu tono debe ser profesional, amable, empático y resolutivo. Tratás a los padres o tutores con respeto.
-Tu objetivo principal es asistir con consultas administrativas, pagos y estado de cuenta de los alumnos.
+// Definición de la herramienta para OpenAI
+const tools = [
+    {
+        type: "function",
+        function: {
+            name: "consultarDeuda",
+            description: "Consulta el estado de deuda de un alumno usando su número de documento (DNI).",
+            parameters: {
+                type: "object",
+                properties: {
+                    dni: { type: "string", description: "El DNI del alumno (sin puntos ni espacios)." }
+                },
+                required: ["dni"]
+            }
+        }
+    }
+];
 
-Reglas de comportamiento:
-1. Tus respuestas deben ser cortas, claras y directas. Evitá párrafos largos.
-2. Cuando te saluden, presentate brevemente e invitá al usuario a que te diga el DNI o el nombre completo del alumno para poder consultar su estado en el sistema.
-3. BAJO NINGÚN CONCEPTO inventes montos de deuda, fechas de vencimiento o datos de alumnos.
-4. Si te preguntan sobre temas que no sean del colegio (clima, política, chistes), aclará cortésmente que tu rol es exclusivamente administrativo y del colegio.`;
+// Función que realmente va a Postgres
+async function ejecutarConsultaDeuda(dni) {
+    const query = `
+        SELECT 
+            a.nombres, 
+            a.apellido, 
+            r.monto, 
+            r.estado, 
+            r.periodo 
+        FROM portal_alumno a
+        INNER JOIN portal_registrodeuda r ON a.documento = r.alumno_id
+        WHERE a.documento = $1;
+    `;
+    const res = await pool.query(query, [dni]);
+    return res.rows;
+}
+
+const promptSistema = `Sos el asistente virtual del Colegio Nuevo Siglo. 
+Tu tono es profesional, amable y resolutivo.
+Si un usuario te saluda, pedile el DNI del alumno para consultar su estado.
+Cuando tengas los datos de deuda, informalos de forma clara (periodo, monto y estado).
+Si el alumno no tiene deuda, felicitalo por estar al día.
+REGLA: Solo podés dar información si usás la herramienta 'consultarDeuda'.`;
 
 app.post('/webhook', async (req, res) => {
     const body = req.body;
 
-    // 1. Validamos que el evento sea la llegada de un mensaje
-    if (body.event === 'messages.upsert') {
-        const data = body.data;
+    if (body.event === 'messages.upsert' && !body.data.key.fromMe) {
+        const numeroPadre = body.data.key.remoteJid;
+        const mensajeEntrante = body.data.message?.conversation || body.data.message?.extendedTextMessage?.text;
 
-        // 2. Filtro de seguridad: ignorar mensajes enviados por el propio bot
-        if (data.key.fromMe) {
-            return res.status(200).send('EVENT_RECEIVED');
-        }
-
-        // 3. Extraemos la información útil
-        const numeroPadre = data.key.remoteJid;
-        const nombrePadre = data.pushName;
-
-        let mensajeEntrante = '';
-
-        // Evolution API manda el texto plano en 'conversation'
-        if (data.message && data.message.conversation) {
-            mensajeEntrante = data.message.conversation;
-        }
-        // Si mandan un emoji o texto citado, puede venir en 'extendedTextMessage'
-        else if (data.message && data.message.extendedTextMessage && data.message.extendedTextMessage.text) {
-            mensajeEntrante = data.message.extendedTextMessage.text;
-        }
-
-        // 4. Imprimimos el resultado limpio
         if (mensajeEntrante) {
-            console.log(`Mensaje de ${nombrePadre} (${numeroPadre}): ${mensajeEntrante}`);
-
             try {
-                const response = await openai.chat.completions.create({
+                // 1. Primer llamado a OpenAI para ver si necesita la función
+                let response = await openai.chat.completions.create({
                     model: 'gpt-4o-mini',
-                    temperature: 0.2, // Lo bajamos a 0.2 para que sea estructurado y estricto
+                    temperature: 0.2,
                     messages: [
                         { role: 'system', content: promptSistema },
                         { role: 'user', content: mensajeEntrante }
-                    ]
+                    ],
+                    tools: tools
                 });
 
-                const respuestaIA = response.choices[0].message.content;
-                console.log(`Respuesta IA: ${respuestaIA}`);
+                let message = response.choices[0].message;
 
+                // 2. Si la IA quiere usar la función (tool_calls)
+                if (message.tool_calls) {
+                    const toolCall = message.tool_calls[0];
+                    const { dni } = JSON.parse(toolCall.function.arguments);
+
+                    console.log(`Consultando deuda para DNI: ${dni}`);
+                    const datosDeuda = await ejecutarConsultaDeuda(dni);
+
+                    // 3. Le pasamos el resultado de la DB de vuelta a la IA
+                    response = await openai.chat.completions.create({
+                        model: 'gpt-4o-mini',
+                        messages: [
+                            { role: 'system', content: promptSistema },
+                            { role: 'user', content: mensajeEntrante },
+                            message,
+                            {
+                                role: 'tool',
+                                tool_call_id: toolCall.id,
+                                content: JSON.stringify(datosDeuda)
+                            }
+                        ]
+                    });
+                }
+
+                const respuestaFinal = response.choices[0].message.content;
+
+                // 4. Enviar respuesta por WhatsApp
                 await axios.post(`${EVOLUTION_API_URL}/message/sendText/${INSTANCE_NAME}`, {
                     number: numeroPadre,
-                    text: respuestaIA
-                }, {
-                    headers: {
-                        apikey: EVOLUTION_API_KEY
-                    }
-                });
+                    text: respuestaFinal
+                }, { headers: { apikey: EVOLUTION_API_KEY } });
+
             } catch (error) {
-                console.error('Error procesando con OpenAI o enviando por Evolution API:', error);
+                console.error('Error en el flujo:', error);
             }
-        } else {
-            console.log(`Se recibió un archivo, audio o formato no soportado de ${nombrePadre}`);
         }
     }
-
-    // Siempre devolver 200 rápido para que Evolution no reintente el envío
     res.status(200).send('EVENT_RECEIVED');
 });
 
-app.listen(PORT, () => {
-    console.log(`Servidor Express de RenderByte escuchando en el puerto ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Servidor de RenderByte operativo en puerto ${PORT}`));
