@@ -12,6 +12,15 @@ const openai = new OpenAI({
 const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL;
 const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY;
 const INSTANCE_NAME = 'colegio-bot';
+const { Pool } = require('pg');
+
+// Configuramos la conexión a la base de datos del colegio
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false // Necesario para bases de datos en la nube como Railway
+    }
+});
 
 app.use(express.json());
 
